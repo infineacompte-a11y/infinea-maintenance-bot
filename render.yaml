@@ -1,0 +1,19 @@
+# Render Blueprint — Infinea Maintenance Bot
+# Deploy: connect this repo to Render, set env vars
+services:
+  - type: worker
+    name: infinea-maintenance-bot
+    runtime: node
+    buildCommand: npm ci
+    startCommand: node bot.js
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: DASHBOARD_URL
+        value: https://infinea-dashboard.vercel.app

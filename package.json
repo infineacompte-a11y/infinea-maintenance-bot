@@ -1,0 +1,17 @@
+{
+  "name": "infinea-maintenance-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Infinea Maintenance Bot — Discord agent with Groq LLM (24/7 cloud)",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
