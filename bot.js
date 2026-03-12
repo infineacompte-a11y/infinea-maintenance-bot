@@ -829,6 +829,318 @@ async function runGitHubAudit() {
   return results.filter(Boolean);
 }
 
+// ══════════════════════════════════════════════════════════════════
+// MODULE 9: AutoAuditor — Audit automatique du code via GitHub API
+// ══════════════════════════════════════════════════════════════════
+
+async function fetchFileContent(repo, path) {
+  if (!GITHUB_TOKEN) return null;
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${GITHUB_ORG}/${repo}/contents/${path}`,
+      {
+        headers: {
+          "Accept": "application/vnd.github+json",
+          "Authorization": `Bearer ${GITHUB_TOKEN}`,
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Buffer.from(data.content, "base64").toString("utf-8");
+  } catch {
+    return null;
+  }
+}
+
+const GITHUB_FILE_URL = (path) => `https://github.com/${GITHUB_ORG}/Infinea-/blob/main/${path}`;
+
+function auditCICD(deployYml) {
+  const findings = [];
+  const url = GITHUB_FILE_URL(".github/workflows/deploy.yml");
+
+  if (!deployYml) {
+    findings.push({ severity: "critical", title: "Fichier deploy.yml introuvable", description: "Aucun workflow CI/CD detecte dans .github/workflows/deploy.yml", url });
+    return findings;
+  }
+
+  const lower = deployYml.toLowerCase();
+
+  if (!lower.includes("test") && !lower.includes("pytest") && !lower.includes("jest")) {
+    findings.push({ severity: "critical", title: "Aucun test dans le pipeline CI/CD", description: "Le deploy.yml ne contient aucune etape de test (pytest, jest, npm test). Le code est deploye sans verification.", url });
+  }
+  if (!lower.includes("lint") && !lower.includes("eslint") && !lower.includes("flake8") && !lower.includes("ruff")) {
+    findings.push({ severity: "high", title: "Pas de linting dans le CI/CD", description: "Aucun linter (ESLint, flake8, ruff) detecte dans le pipeline.", url });
+  }
+  if (!lower.includes("npm run build") && !lower.includes("yarn build") && !lower.includes("next build")) {
+    findings.push({ severity: "medium", title: "Pas de build explicite dans CI/CD", description: "Le pipeline ne contient pas d'etape de build frontend explicite.", url });
+  }
+  if (!lower.includes("env") || (!lower.includes("check") && !lower.includes("valid"))) {
+    findings.push({ severity: "medium", title: "Pas de validation des variables d'environnement", description: "Le pipeline ne valide pas la presence des variables d'environnement requises.", url });
+  }
+  if (!lower.includes("staging") && !lower.includes("preview")) {
+    findings.push({ severity: "low", title: "Pas d'environnement de staging", description: "Le pipeline deploie directement en production sans etape de staging/preview.", url });
+  }
+  if (!lower.includes("rollback") && !lower.includes("revert")) {
+    findings.push({ severity: "medium", title: "Pas de strategie de rollback", description: "Aucune strategie de rollback automatique detectee dans le pipeline.", url });
+  }
+
+  return findings;
+}
+
+function auditSecurity(files) {
+  const findings = [];
+  const { serverPy, configPy, authPy, envExample } = files;
+  const serverUrl = GITHUB_FILE_URL("backend/server.py");
+  const authUrl = GITHUB_FILE_URL("backend/auth.py");
+  const configUrl = GITHUB_FILE_URL("backend/config.py");
+  const envUrl = GITHUB_FILE_URL("backend/.env.example");
+
+  if (serverPy) {
+    if (serverPy.includes("allow_origins=[\"*\"]") || serverPy.includes('allow_origins=["*"]')) {
+      findings.push({ severity: "critical", title: "CORS ouvert a tous les origines", description: "allow_origins=['*'] detecte dans server.py — permet les requetes depuis n'importe quel domaine.", url: serverUrl });
+    }
+    if (!serverPy.includes("rate_limit") && !serverPy.includes("RateLimit") && !serverPy.includes("slowapi")) {
+      findings.push({ severity: "high", title: "Pas de rate limiting", description: "Aucun rate limiting detecte dans server.py (slowapi, RateLimit).", url: serverUrl });
+    }
+    if (!serverPy.includes("helmet") && !serverPy.includes("security_headers") && !serverPy.includes("CSP")) {
+      findings.push({ severity: "medium", title: "Pas de security headers", description: "Aucun middleware de security headers (CSP, X-Frame-Options, etc.) detecte.", url: serverUrl });
+    }
+  }
+
+  if (authPy) {
+    if (authPy.includes("verify=False") || authPy.includes("verify_ssl=False")) {
+      findings.push({ severity: "critical", title: "Verification SSL desactivee dans auth", description: "verify=False detecte — les certificats SSL ne sont pas verifies.", url: authUrl });
+    }
+    if (!authPy.includes("bcrypt") && !authPy.includes("passlib") && !authPy.includes("argon2")) {
+      findings.push({ severity: "high", title: "Pas de hashing de mots de passe", description: "Aucune librairie de hashing (bcrypt, passlib, argon2) detectee dans auth.py.", url: authUrl });
+    }
+  }
+
+  if (configPy) {
+    if (configPy.includes("DEBUG = True") || configPy.includes("debug=True")) {
+      findings.push({ severity: "high", title: "Mode debug actif en production", description: "DEBUG=True detecte dans config.py — risque d'exposition de donnees sensibles.", url: configUrl });
+    }
+    if (configPy.includes("SECRET") && configPy.includes("=") && configPy.includes('"')) {
+      if (!configPy.includes("os.environ") && !configPy.includes("os.getenv")) {
+        findings.push({ severity: "critical", title: "Secrets potentiellement hardcodes", description: "Des valeurs SECRET detectees dans config.py sans reference a os.environ/os.getenv.", url: configUrl });
+      }
+    }
+  }
+
+  if (envExample) {
+    const lines = envExample.split("\n").filter(l => l.includes("=") && !l.startsWith("#"));
+    const withValues = lines.filter(l => {
+      const val = l.split("=")[1]?.trim();
+      return val && val !== "" && val !== '""' && val !== "''" && !val.startsWith("your_") && !val.startsWith("<");
+    });
+    if (withValues.length > 0) {
+      findings.push({ severity: "medium", title: "Valeurs non-placeholder dans .env.example", description: `${withValues.length} variable(s) avec des valeurs reelles dans .env.example au lieu de placeholders.`, url: envUrl });
+    }
+  }
+
+  return findings;
+}
+
+function auditBackend(files) {
+  const findings = [];
+  const { requirements, serverPy, databasePy } = files;
+  const reqUrl = GITHUB_FILE_URL("backend/requirements.txt");
+  const serverUrl = GITHUB_FILE_URL("backend/server.py");
+  const dbUrl = GITHUB_FILE_URL("backend/database.py");
+
+  if (requirements) {
+    const lines = requirements.split("\n").filter(l => l.trim() && !l.startsWith("#"));
+    const unpinned = lines.filter(l => !l.includes("==") && !l.includes(">=") && !l.includes("~=") && l.trim().length > 0);
+
+    if (unpinned.length > 3) {
+      findings.push({ severity: "high", title: `${unpinned.length} dependances non pinnees`, description: `Dependances sans version fixe: ${unpinned.slice(0, 5).join(", ")}${unpinned.length > 5 ? "..." : ""}. Risque de regression lors d'un install.`, url: reqUrl });
+    }
+    if (!lines.some(l => l.includes("python-dotenv"))) {
+      findings.push({ severity: "medium", title: "python-dotenv absent", description: "python-dotenv non detecte dans requirements.txt — gestion .env potentiellement manuelle.", url: reqUrl });
+    }
+  }
+
+  if (serverPy) {
+    if (!serverPy.includes("/health") && !serverPy.includes("/api/health")) {
+      findings.push({ severity: "high", title: "Pas de health check endpoint", description: "Aucun endpoint /health ou /api/health detecte dans server.py.", url: serverUrl });
+    }
+    if (!serverPy.includes("exception_handler") && !serverPy.includes("@app.exception")) {
+      findings.push({ severity: "medium", title: "Pas de global exception handler", description: "Aucun gestionnaire d'exceptions global detecte dans server.py.", url: serverUrl });
+    }
+    if (!serverPy.includes("logging") && !serverPy.includes("logger")) {
+      findings.push({ severity: "medium", title: "Pas de logging structure", description: "Aucun import logging detecte dans server.py.", url: serverUrl });
+    }
+  }
+
+  if (databasePy) {
+    if (!databasePy.includes("index") && !databasePy.includes("create_index")) {
+      findings.push({ severity: "medium", title: "Pas d'indexation MongoDB explicite", description: "Aucun create_index detecte dans database.py — requetes potentiellement lentes.", url: dbUrl });
+    }
+    if (!databasePy.includes("try") && !databasePy.includes("except")) {
+      findings.push({ severity: "high", title: "Pas de gestion d'erreurs DB", description: "Aucun try/except detecte dans database.py — les erreurs de connexion ne sont pas gerees.", url: dbUrl });
+    }
+  }
+
+  return findings;
+}
+
+function auditFrontend(files) {
+  const findings = [];
+  const { packageJson, cracoConfig } = files;
+  const pkgUrl = GITHUB_FILE_URL("frontend/package.json");
+  const cracoUrl = GITHUB_FILE_URL("frontend/craco.config.js");
+
+  if (packageJson) {
+    let pkg;
+    try { pkg = JSON.parse(packageJson); } catch { return findings; }
+
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+    const reactVersion = deps.react;
+    if (reactVersion && !reactVersion.includes("19") && !reactVersion.includes("18")) {
+      findings.push({ severity: "medium", title: `Version React ancienne: ${reactVersion}`, description: "La version de React n'est ni 18 ni 19.", url: pkgUrl });
+    }
+    if (!pkg.scripts?.test || pkg.scripts.test.includes("no test")) {
+      findings.push({ severity: "high", title: "Pas de script de test", description: "Le package.json n'a pas de script 'test' fonctionnel.", url: pkgUrl });
+    }
+    if (!pkg.scripts?.lint && !deps.eslint) {
+      findings.push({ severity: "medium", title: "Pas de linter configure", description: "Ni script lint ni ESLint detecte dans package.json.", url: pkgUrl });
+    }
+
+    const heavyDeps = ["moment", "lodash", "@material-ui/core", "antd"];
+    for (const dep of heavyDeps) {
+      if (deps[dep]) {
+        findings.push({ severity: "low", title: `Dependance lourde: ${dep}`, description: `${dep} detecte — impact potentiel sur la taille du bundle.`, url: pkgUrl });
+      }
+    }
+
+    if (deps["react-scripts"] && deps["react-scripts"].includes("4")) {
+      findings.push({ severity: "medium", title: "react-scripts v4 (ancienne)", description: "react-scripts 4.x detecte — des vulnerabilites connues existent dans cette version.", url: pkgUrl });
+    }
+  }
+
+  if (cracoConfig) {
+    if (!cracoConfig.includes("splitChunks") && !cracoConfig.includes("optimization")) {
+      findings.push({ severity: "low", title: "Pas d'optimisation de chunks", description: "Aucune configuration splitChunks/optimization dans craco.config.js.", url: cracoUrl });
+    }
+  }
+
+  return findings;
+}
+
+async function runAutoAudit() {
+  console.log("AutoAuditor: lancement audit complet du code...");
+
+  try {
+    // 1. Fetch tous les fichiers critiques en parallele
+    const [deployYml, serverPy, configPy, authPy, databasePy, requirements, envExampleBe, packageJson, cracoConfig, envExampleFe] = await Promise.all([
+      fetchFileContent("Infinea-", ".github/workflows/deploy.yml"),
+      fetchFileContent("Infinea-", "backend/server.py"),
+      fetchFileContent("Infinea-", "backend/config.py"),
+      fetchFileContent("Infinea-", "backend/auth.py"),
+      fetchFileContent("Infinea-", "backend/database.py"),
+      fetchFileContent("Infinea-", "backend/requirements.txt"),
+      fetchFileContent("Infinea-", "backend/.env.example"),
+      fetchFileContent("Infinea-", "frontend/package.json"),
+      fetchFileContent("Infinea-", "frontend/craco.config.js"),
+      fetchFileContent("Infinea-", "frontend/.env.example"),
+    ]);
+
+    // 2. Lancer les 4 audits
+    const cicdFindings = auditCICD(deployYml);
+    const securityFindings = auditSecurity({ serverPy, configPy, authPy, envExample: envExampleBe || envExampleFe });
+    const backendFindings = auditBackend({ requirements, serverPy, databasePy });
+    const frontendFindings = auditFrontend({ packageJson, cracoConfig });
+
+    // 3. Construire les rapports d'audit
+    const now = new Date().toISOString();
+
+    function buildStats(findings) {
+      const stats = { total: findings.length, critical: 0, high: 0, medium: 0, low: 0 };
+      for (const f of findings) {
+        if (stats[f.severity] !== undefined) stats[f.severity]++;
+      }
+      return stats;
+    }
+
+    const audits = [
+      {
+        id: "audit-cicd",
+        domain: "cicd",
+        title: "Audit CI/CD, Tests & Dependances",
+        description: "Analyse automatique du pipeline CI/CD (deploy.yml)",
+        severity: cicdFindings.some(f => f.severity === "critical") ? "critical" : cicdFindings.some(f => f.severity === "high") ? "high" : "medium",
+        findings: cicdFindings,
+        stats: buildStats(cicdFindings),
+        status: "completed",
+        timestamp: now,
+      },
+      {
+        id: "audit-security",
+        domain: "security",
+        title: "Audit Securite — Analyse automatique",
+        description: "Verification CORS, rate limiting, auth, secrets, headers",
+        severity: securityFindings.some(f => f.severity === "critical") ? "critical" : securityFindings.some(f => f.severity === "high") ? "high" : "medium",
+        findings: securityFindings,
+        stats: buildStats(securityFindings),
+        status: "completed",
+        timestamp: now,
+      },
+      {
+        id: "audit-backend",
+        domain: "backend",
+        title: "Audit Backend — Analyse automatique",
+        description: "Verification dependances, server, database, error handling",
+        severity: backendFindings.some(f => f.severity === "critical") ? "critical" : backendFindings.some(f => f.severity === "high") ? "high" : "medium",
+        findings: backendFindings,
+        stats: buildStats(backendFindings),
+        status: "completed",
+        timestamp: now,
+      },
+      {
+        id: "audit-frontend",
+        domain: "frontend",
+        title: "Audit Frontend — Analyse automatique",
+        description: "Verification React, dependances, build, tests, bundle",
+        severity: frontendFindings.some(f => f.severity === "critical") ? "critical" : frontendFindings.some(f => f.severity === "high") ? "high" : "medium",
+        findings: frontendFindings,
+        stats: buildStats(frontendFindings),
+        status: "completed",
+        timestamp: now,
+      },
+    ];
+
+    // 4. Envoyer au dashboard (remplacement complet)
+    const res = await fetch(`${DASHBOARD_URL}/api/audits`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audits }),
+    });
+
+    const totalFindings = audits.reduce((sum, a) => sum + a.findings.length, 0);
+    const totalCritical = audits.reduce((sum, a) => sum + a.stats.critical, 0);
+    const totalHigh = audits.reduce((sum, a) => sum + a.stats.high, 0);
+
+    if (res.ok) {
+      console.log(`AutoAuditor: ${totalFindings} findings (${totalCritical} critiques, ${totalHigh} high) envoyes au dashboard`);
+      syncLogToDashboard(
+        `Auto-audit complet: ${totalFindings} findings (${totalCritical} critiques, ${totalHigh} high)`,
+        totalCritical > 0 ? "warning" : "success",
+        { description: `4 domaines audites: CI/CD (${cicdFindings.length}), Securite (${securityFindings.length}), Backend (${backendFindings.length}), Frontend (${frontendFindings.length})`, category: "audit" }
+      );
+    } else {
+      console.error("AutoAuditor: erreur envoi dashboard:", res.status);
+    }
+
+    return audits;
+  } catch (e) {
+    console.error("AutoAuditor error:", e.message);
+    return null;
+  }
+}
+
 // ── Audit Findings Cache ──
 
 let cachedAuditFindings = { critical: 0, high: 0, medium: 0, low: 0, total: 0 };
@@ -1282,10 +1594,13 @@ async function refreshGitHubData() {
     ]);
     await refreshAuditFindings();
 
-    // Detection de deploiements
+    // Detection de deploiements + re-audit si deploy detecte
     const newDeploys = detectNewDeploys(githubData);
     if (newDeploys.length > 0) {
       await notifyNewDeploys(newDeploys);
+      // Re-audit automatique apres un deploy (le code a potentiellement change)
+      console.log("Deploy detecte — lancement re-audit automatique...");
+      await runAutoAudit();
     }
 
     // Alerte securite si nouvelles vulns critiques
@@ -1334,6 +1649,8 @@ client.once(Events.ClientReady, () => {
     await refreshGitHubData();
     await liveDashboardSync();
     await periodicSSLCheck();
+    await runAutoAudit();
+    await refreshAuditFindings();
     sendHourlyCheckup();
 
     // 2. Deep health checks + anomalies + alertes → dashboard toutes les 15 secondes
@@ -1351,6 +1668,13 @@ client.once(Events.ClientReady, () => {
     // 5. Verification SSL toutes les 6 heures
     setInterval(periodicSSLCheck, 6 * 60 * 60 * 1000);
     console.log("Verification SSL active (toutes les 6h)");
+
+    // 6. Auto-audit du code toutes les 6 heures
+    setInterval(async () => {
+      await runAutoAudit();
+      await refreshAuditFindings();
+    }, 6 * 60 * 60 * 1000);
+    console.log("Auto-audit du code actif (toutes les 6h + post-deploy)");
   }, 10 * 1000);
 });
 
