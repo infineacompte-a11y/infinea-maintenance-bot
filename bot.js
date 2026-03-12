@@ -521,15 +521,50 @@ async function sendHourlyCheckup() {
   }
 }
 
+// ── Live Dashboard Sync (toutes les 15 secondes) ──
+
+let cachedGithubData = [];
+
+async function liveDashboardSync() {
+  try {
+    const healthChecks = await runHealthChecks();
+    await updateDashboardStatus(healthChecks, cachedGithubData);
+  } catch (e) {
+    console.error("Live sync error:", e.message);
+  }
+}
+
+async function refreshGitHubData() {
+  try {
+    console.log("Refresh GitHub data...");
+    cachedGithubData = await runGitHubAudit();
+    console.log(`GitHub: ${cachedGithubData.length} repos audites`);
+  } catch (e) {
+    console.error("GitHub refresh error:", e.message);
+  }
+}
+
 // ── Demarrage ──
 
 client.once(Events.ClientReady, () => {
-  // Premier audit dans 10 secondes, puis toutes les heures
-  setTimeout(() => {
+  // 1. Premier audit complet immediat (10s)
+  setTimeout(async () => {
+    await refreshGitHubData();
+    await liveDashboardSync();
     sendHourlyCheckup();
+
+    // 2. Health checks → dashboard toutes les 15 secondes
+    setInterval(liveDashboardSync, 15 * 1000);
+    console.log("Live sync dashboard actif (toutes les 15s)");
+
+    // 3. Refresh GitHub toutes les 15 minutes
+    setInterval(refreshGitHubData, 15 * 60 * 1000);
+    console.log("Refresh GitHub actif (toutes les 15min)");
+
+    // 4. Rapport Discord toutes les heures
     setInterval(sendHourlyCheckup, HOURLY_INTERVAL);
+    console.log("Rapport Discord horaire actif");
   }, 10 * 1000);
-  console.log("Premier audit dans 10 secondes, puis toutes les heures.");
 });
 
 client.login(DISCORD_TOKEN);
