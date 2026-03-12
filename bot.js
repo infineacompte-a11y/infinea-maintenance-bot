@@ -314,7 +314,7 @@ async function sendDiscordAlert(anomaly) {
   try {
     await channel.send(alertMsg);
     pushMetric("alertEvents", { severity: anomaly.severity, message: anomaly.message });
-    syncLogToDashboard(`Alerte ${anomaly.severity}: ${anomaly.message.slice(0, 80)}`, anomaly.severity === "critical" ? "error" : "warning");
+    syncLogToDashboard(`Alerte ${anomaly.severity}: ${anomaly.message.slice(0, 80)}`, anomaly.severity === "critical" ? "error" : "warning", { description: anomaly.message, category: "supervision" });
   } catch (e) {
     console.error("Erreur envoi alerte Discord:", e.message);
   }
@@ -417,7 +417,7 @@ async function notifyNewDeploys(deploys) {
     const msg = `\u{1F680} **Nouveau deploiement detecte — ${d.repo}**\nCommit: \`${d.sha}\` — "${d.message}"\nAuteur: ${d.author}\n_${new Date(d.pushedAt).toLocaleString("fr-FR")}_`;
     try {
       await channel.send(msg);
-      syncLogToDashboard(`Deploy detecte: ${d.repo} — ${d.message?.slice(0, 50)}`, "success");
+      syncLogToDashboard(`Deploy detecte: ${d.repo} — ${d.message?.slice(0, 50)}`, "success", { description: `Commit ${d.sha} par ${d.author}: "${d.message}"`, category: "deploy" });
     } catch (e) {
       console.error("Erreur notification deploy:", e.message);
     }
@@ -762,7 +762,14 @@ async function syncMessageToDashboard(_from, content, type = "bot") {
   }
 }
 
-async function syncLogToDashboard(title, type = "info") {
+const TYPE_TO_SEVERITY = {
+  error: "critical",
+  warning: "high",
+  success: "info",
+  info: "info",
+};
+
+async function syncLogToDashboard(title, type = "info", { description = "", category = "system" } = {}) {
   try {
     await fetch(`${DASHBOARD_URL}/api/logs`, {
       method: "POST",
@@ -770,6 +777,9 @@ async function syncLogToDashboard(title, type = "info") {
       body: JSON.stringify({
         title,
         type,
+        severity: TYPE_TO_SEVERITY[type] || "info",
+        description,
+        category,
         timestamp: new Date().toISOString(),
       }),
     });
@@ -817,6 +827,31 @@ async function fetchGitHubRepoData(repo) {
 async function runGitHubAudit() {
   const results = await Promise.all(GITHUB_REPOS.map(fetchGitHubRepoData));
   return results.filter(Boolean);
+}
+
+// ── Audit Findings Cache ──
+
+let cachedAuditFindings = { critical: 0, high: 0, medium: 0, low: 0, total: 0 };
+
+async function refreshAuditFindings() {
+  try {
+    const res = await fetch(`${DASHBOARD_URL}/api/audits`, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return;
+    const audits = await res.json();
+    if (!Array.isArray(audits)) return;
+
+    const counts = { critical: 0, high: 0, medium: 0, low: 0, total: 0 };
+    for (const audit of audits) {
+      if (!audit.findings) continue;
+      for (const f of audit.findings) {
+        counts.total++;
+        if (counts[f.severity] !== undefined) counts[f.severity]++;
+      }
+    }
+    cachedAuditFindings = counts;
+  } catch (e) {
+    // Silencieux — on garde le cache precedent
+  }
 }
 
 // ── Dashboard Update (ENRICHI avec metriques supervision) ──
@@ -892,12 +927,13 @@ async function updateDashboardStatus(healthChecks, githubData) {
     const statusPayload = {
       systems,
       stats: {
-        criticalIssues: systemCriticals + criticalAnomalies.length,
-        highIssues: systemWarnings + highAnomalies.length,
-        mediumIssues: cachedSecurityData.alerts.filter(a => a.severity === "medium").length,
-        lowIssues: cachedSecurityData.alerts.filter(a => a.severity === "low").length,
+        criticalIssues: cachedAuditFindings.critical + systemCriticals + criticalAnomalies.length,
+        highIssues: cachedAuditFindings.high + systemWarnings + highAnomalies.length,
+        mediumIssues: cachedAuditFindings.medium + cachedSecurityData.alerts.filter(a => a.severity === "medium").length,
+        lowIssues: cachedAuditFindings.low + cachedSecurityData.alerts.filter(a => a.severity === "low").length,
         auditsCompleted: githubData.length,
         fixesApplied: recentCommitCount,
+        auditFindings: cachedAuditFindings.total,
       },
       supervision: {
         anomalies: anomalies.length,
@@ -977,7 +1013,7 @@ client.once(Events.ClientReady, (c) => {
   );
   console.log("Modules actifs: MetricsStore, DeepHealthChecks, AnomalyDetector, AlertSystem, UptimeTracker, DeployDetector, SecurityMonitor, SelfDiagnostic");
 
-  syncLogToDashboard("Bot Maintenance connecte — Supervision complete activee", "success");
+  syncLogToDashboard("Bot Maintenance connecte — Supervision complete activee", "success", { description: "Modules actifs: Health, Anomalies, Uptime, Securite, Deploys, SSL, Self-diag", category: "system" });
   syncMessageToDashboard("Maintenance Agent", "Bot en ligne. Modules: Health, Anomalies, Uptime, Securite, Deploys, Self-diag. Supervision active.", "system");
 });
 
@@ -1029,7 +1065,7 @@ client.on(Events.MessageCreate, async (message) => {
     addToHistory(message.channel.id, "assistant", reply);
 
     syncMessageToDashboard("Maintenance Agent", reply, "bot");
-    syncLogToDashboard(`Reponse a: "${cleanContent.slice(0, 60)}"`, "info");
+    syncLogToDashboard(`Reponse a: "${cleanContent.slice(0, 60)}"`, "info", { description: `Message de ${message.author.username} traite par Groq`, category: "conversation" });
 
     if (reply.length > 2000) {
       const chunks = reply.match(/[\s\S]{1,1990}/g) || [reply];
@@ -1194,7 +1230,7 @@ async function sendHourlyCheckup() {
     }
 
     console.log(`Check-up horaire envoye a ${new Date().toISOString()} (${anomalies.length} anomalies, ${newDeploys.length} deploys)`);
-    syncLogToDashboard(`Check-up horaire complet — ${anomalies.length} anomalies, uptime BE ${formatUptimeForDisplay(u1h.backend)}`, "success");
+    syncLogToDashboard(`Check-up horaire complet — ${anomalies.length} anomalies, uptime BE ${formatUptimeForDisplay(u1h.backend)}`, "success", { description: `${deepChecks.length} endpoints, ${sslChecks.length} SSL, ${githubData.length} repos, ${newDeploys.length} deploys`, category: "audit" });
   } catch (error) {
     console.error("Erreur check-up horaire:", error.message);
   }
@@ -1239,11 +1275,12 @@ async function liveDashboardSync() {
 
 async function refreshGitHubData() {
   try {
-    console.log("Refresh GitHub data + securite...");
+    console.log("Refresh GitHub data + securite + audit findings...");
     const [githubData, securityData] = await Promise.all([
       runGitHubAudit(),
       checkGitHubSecurityAlerts(),
     ]);
+    await refreshAuditFindings();
 
     // Detection de deploiements
     const newDeploys = detectNewDeploys(githubData);
@@ -1280,7 +1317,7 @@ async function periodicSSLCheck() {
           message: `Certificat SSL invalide: ${issue.hostname} — ${issue.detail}`,
         });
       }
-      syncLogToDashboard(`SSL: ${issues.length} certificat(s) invalide(s)`, "error");
+      syncLogToDashboard(`SSL: ${issues.length} certificat(s) invalide(s)`, "error", { description: issues.map(i => `${i.hostname}: ${i.detail}`).join("; "), category: "security" });
     } else {
       console.log("SSL check OK — tous les certificats valides");
     }
