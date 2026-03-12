@@ -524,11 +524,12 @@ async function sendHourlyCheckup() {
 // ── Demarrage ──
 
 client.once(Events.ClientReady, () => {
+  // Premier audit dans 10 secondes, puis toutes les heures
   setTimeout(() => {
     sendHourlyCheckup();
     setInterval(sendHourlyCheckup, HOURLY_INTERVAL);
-  }, 5 * 60 * 1000);
-  console.log("Check-ups horaires programmes (premier dans 5 min, puis toutes les heures).");
+  }, 10 * 1000);
+  console.log("Premier audit dans 10 secondes, puis toutes les heures.");
 });
 
 client.login(DISCORD_TOKEN);
